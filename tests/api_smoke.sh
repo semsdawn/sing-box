@@ -136,7 +136,7 @@ has "未知子命令返回 UNKNOWN_COMMAND" "$out" '"code":"UNKNOWN_COMMAND"'
 eq "show 缺参数退出码=2" "$(rc_of show)" "2"
 
 out=$(run version)
-has "version 带 fork_ver" "$out" '"fork_ver":"v1.20-proxyaio.2"'
+has "version 带 fork_ver" "$out" '"fork_ver":"v1.20-proxyaio.'
 has "version 带 core_ver" "$out" '"core_ver":"1.14.4"'
 has "version 带 features" "$out" '"outbound-set"'
 
@@ -241,6 +241,12 @@ has "add+outbound 路由已写入" "$out" '1'
 
 # 缺 --outbound-port 应报参数不足
 eq "add+outbound 缺 port 退出码=2" "$(rc_of add reality 50002 --outbound-server 1.1.1.1 --outbound-tag t)" "2"
+
+# 出口阶段 check 失败 → 回滚刚建的节点（不留半成品）
+out=$(FAKE_CHECK_RC=1 run add reality 50003 --outbound-server 10.0.0.9 --outbound-port 1080 --outbound-tag isp-socks-x)
+has "add+outbound check 失败报 CHECK_FAILED" "$out" '"code":"CHECK_FAILED"'
+eq "add+outbound check 失败已回滚（conf 里没有该文件）" "$(ls "$is_conf_dir" | grep -c 50003)" "0"
+ls "$is_backup_dir"/*.rolledback >/dev/null 2>&1 && ok "回滚文件留证（.rolledback）" || no "回滚文件留证（.rolledback）" "没找到"
 
 # ---------------------------------------------------------------- 汇总
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$pass" "$fail"

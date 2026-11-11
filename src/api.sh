@@ -352,7 +352,8 @@ api_cmd_add() {
         work=$(mktemp 2>/dev/null || mktemp -t sbwork)
         if ! api__transform_outbound "$path" "$work" "$ob_tag" "socks" "$ob_server" "$ob_port" "$ob_rfi" "$cred_file" 2>/dev/null; then
             rm -f "$work" "$cred_file"
-            api_error 3 TRANSFORM_FAILED "出口配置变换失败（节点已建、出口未写入）" "sb api outbound set $file --server $ob_server --port $ob_port --tag $ob_tag"
+            api__rollback_new_conf "$path"
+            api_error 3 TRANSFORM_FAILED "出口配置变换失败，已回滚（未留下半成品）" "sb api add $alias --addr <IP> --outbound-server $ob_server --outbound-port $ob_port --outbound-tag $ob_tag"
         fi
         rm -f "$cred_file"
         if [[ $is_dry -eq 1 ]]; then
@@ -366,12 +367,14 @@ api_cmd_add() {
                 cout=$($is_core_bin check -c "$work" 2>&1)
                 if [[ $? -ne 0 ]]; then
                     rm -f "$work"
-                    api_error 3 CHECK_FAILED "sing-box check 未通过（节点已建、出口未写入）: $(printf '%s' "$cout" | tail -n 2 | tr '\n' ' ')" "sb api check $file"
+                    api__rollback_new_conf "$path"
+                    api_error 3 CHECK_FAILED "sing-box check 未通过，已回滚刚建的节点: $(printf '%s' "$cout" | tail -n 2 | tr '\n' ' ')" "sb api add $alias --addr <IP> --outbound-server $ob_server --outbound-port $ob_port --outbound-tag $ob_tag"
                 fi
             fi
             if ! mv -f "$work" "$path" 2>/dev/null; then
                 rm -f "$work"
-                api_error 3 WRITE_FAILED "出口写入失败（节点已建、出口未写入）" "sb api show $file"
+                api__rollback_new_conf "$path"
+                api_error 3 WRITE_FAILED "出口写入失败，已回滚刚建的节点" "sb api add $alias --addr <IP> --outbound-server $ob_server --outbound-port $ob_port --outbound-tag $ob_tag"
             fi
             out_json=$(jq -cn --arg t "$ob_tag" --arg s "$ob_server" --argjson p "$ob_port" --argjson rfi "$ob_rfi" \
                 '{tag:$t,server:$s,server_port:$p,route_from_inbound:($rfi==1),applied:true}')
@@ -430,6 +433,18 @@ api_cmd_del() {
 }
 
 # ---------------------------------------------------------------- Part 3：写入/移除出口配置
+
+# 回滚刚建好的 conf：移到 backup 目录（保留证据），保证"一次性 add"失败时不留半成品
+api__rollback_new_conf() {
+    local path=$1 name
+    name=$(basename "$path")
+    mkdir -p "$is_backup_dir" 2>/dev/null
+    if [[ -d $is_backup_dir ]]; then
+        mv -f "$path" "$is_backup_dir/$name.$(api__now).rolledback" 2>/dev/null || rm -f "$path"
+    else
+        rm -f "$path"
+    fi
+}
 
 # 把 outbound 变换应用到 $src，输出到 $out（不改原文件）
 # 参数: <src> <out> <tag> <type> <server> <port> <rfi 0|1> <cred-file>
