@@ -113,3 +113,38 @@ Usage: sing-box [options]... [args]...
 反馈问题) https://github.com/233boy/sing-box/issues
 文档(doc) https://233boy.com/sing-box/sing-box-script/
 ```
+---
+
+# Fork 说明（proxyaio）
+
+本仓库是 `233boy/sing-box` 的 fork，供 [proxyAIO](https://github.com/semsdawn/proxyAIO) 面板调用。**人类交互（菜单、prompt、颜色、快捷参数）与上游一致，未做破坏性改动。**
+
+## 机器通道：`sb api …`
+
+给面板/自动化用的通道，**stdout 只输出一个 JSON 对象**，人类提示走 stderr；退出码即契约。
+
+```bash
+sb api version                 # 版本与能力（sh_ver / fork_ver / core_ver / features）
+sb api list                    # 全部配置文件摘要
+sb api show <file|tag>         # 整份配置（--raw 只输出原文）
+sb api get <file> <jq路径>      # 任意路径取值
+sb api check <file>            # sing-box check 结构化结果
+sb api port free               # 分配空闲端口
+sb api restart                 # 重启并返回 is-active
+sb api outbound set|unset ...  # 写入/移除出口配置（凭据只走 stdin）
+```
+
+输出格式：
+
+```json
+{"ok":true,"cmd":"outbound.set","data":{...},"warnings":[]}
+{"ok":false,"cmd":"add","code":"NEED_INPUT","message":"缺少端口","hint":"sb add r 39049"}
+```
+
+退出码：`0` 成功 / `2` 需要交互或参数不足 / `3` 校验或执行失败 / `4` 未找到 / `1` 其它。
+
+## 约定
+
+- **凭据永不进 argv、永不回显、永不写日志**；需要认证的操作从 stdin 读 JSON。
+- 备份与临时文件落 `/etc/sing-box/backup/`，**不写入 conf 目录**（`sb` 会枚举 conf 目录，混入 `.bak` 会导致交互式选择失败）。
+- 定制提交保持小而可读，便于 `git rebase upstream/main`。

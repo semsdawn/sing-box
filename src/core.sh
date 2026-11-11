@@ -1676,6 +1676,11 @@ is_main_menu() {
 # check prefer args, if not exist prefer args and show main menu
 main() {
     case $1 in
+    api)
+        # proxyaio fork: 机器通道（人类子命令行为不变）
+        load api.sh
+        api_main "${@:2}"
+        ;;
     a | add | gen | no-auto-tls)
         [[ $1 == 'gen' ]] && is_gen=1
         [[ $1 == 'no-auto-tls' ]] && is_no_auto_tls=1
