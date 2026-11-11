@@ -155,3 +155,26 @@ sb api outbound set|unset ...  # 写入/移除出口配置（凭据只走 stdin�
 - `derived` 不依赖固定下标，按数组遍历算：`inbounds[]`（含 `users[].flow`）、`outbounds[]`（`has_auth` 只报布尔）、`route.rules[]`、`tls`（私钥/公钥只报布尔）。
 - `conf_candidates()` 统一了解析顺序：**精确 → 唯一前缀**，且永远排除 `.bak` / `.tmp` / `.json.json`（`sb del` 曾因 `.bak` 混入候选而失败）。
 - 自测：`bash tests/api_smoke.sh`（34 项，纯本地、不需要真机）。
+
+## 出口配置写入（Part 3）
+
+```bash
+# 写入/覆盖一条 socks 出口，并把本节点 inbound 路由到它（凭据走 stdin）
+printf '{"username":"u","password":"p"}' | sb api outbound set VLESS-REALITY-39049.json \
+  --type socks --server 136.162.193.215 --port 51524 --tag isp-socks-39049 \
+  --auth-stdin --route-from-inbound
+
+# 移除
+sb api outbound unset VLESS-REALITY-39049.json --tag isp-socks-39049
+```
+
+行为与安全约束：
+
+| 项 | 说明 |
+|---|---|
+| 原子性 | `jq 变换 → sing-box check → mv`；check 不过**一个字节都不写** |
+| 备份 | 落 `/etc/sing-box/backup/<file>.<时间戳>.bak`，**不写 conf 目录** |
+| 幂等 | 归一化后内容一致 → `changed:false`，不写、不重启 |
+| 重启 | **默认不重启**；需要时加 `--restart`（批量场景由调用方统一重启一次） |
+| 凭据 | 只经 stdin（临时文件 600 权限，用完即删）；输出只报 `has_auth`，永不回显 |
+| 预演 | `--dry-run` 输出将要发生的 diff，不落盘 |

@@ -140,7 +140,68 @@ has "version 带 fork_ver" "$out" '"fork_ver":"v1.20-proxyaio.1"'
 has "version 带 core_ver" "$out" '"core_ver":"1.14.4"'
 has "version 带 features" "$out" '"outbound-set"'
 
-eq "outbound 在 Part 3 前是 NOT_IMPLEMENTED" "$(rc_of outbound set x)" "1"
+eq "outbound 缺子命令退出码=2" "$(rc_of outbound)" "2"
+
+# ---------------------------------------------------------------- outbound set/unset
+
+conf=$is_conf_dir/VLESS-REALITY-39049.json
+before=$(cat "$conf")
+
+# 无认证的裸出站先测：不带 --auth-stdin
+out=$(run outbound set VLESS-REALITY-39049.json --type socks --server 10.0.0.9 --port 1080 --tag isp-socks-test --route-from-inbound)
+has "set 首次 changed=true" "$out" '"changed":true'
+has "set applied=true" "$out" '"applied":true'
+has "set 记录 route_from_inbound" "$out" '"route_from_inbound":true'
+has "set 返回 backup 路径" "$out" '"backup":"'; has "backup 是 .bak 文件" "$out" '.bak"'
+lacks "set 输出不含口令" "$out" "S3CRET"
+
+# 第二次同参数 → 幂等
+out=$(run outbound set VLESS-REALITY-39049.json --type socks --server 10.0.0.9 --port 1080 --tag isp-socks-test --route-from-inbound)
+has "set 重复执行 changed=false" "$out" '"changed":false'
+has "set 重复执行 applied=false" "$out" '"applied":false'
+
+# 结构验证：出站已写入、route 指向它
+out=$(run get VLESS-REALITY-39049.json '[.outbounds[] | select(.tag=="isp-socks-test") | .server_port]|.[0]')
+has "出站写入 server_port" "$out" '1080'
+out=$(run get VLESS-REALITY-39049.json '[.route.rules[] | select(.outbound=="isp-socks-test")]|length')
+has "route 规则已加" "$out" '1'
+
+# 带凭据（--auth-stdin）
+out=$(echo '{"username":"u1","password":"p1"}' | run outbound set VLESS-REALITY-39049.json --type socks --server 10.0.0.10 --port 1081 --tag isp-socks-auth --auth-stdin)
+has "set --auth-stdin 生效" "$out" '"applied":true'
+lacks "set --auth-stdin 不回显口令" "$out" "p1"
+out=$(run get VLESS-REALITY-39049.json '[.outbounds[] | select(.tag=="isp-socks-auth") | .username]|.[0]')
+has "凭据已写入 username" "$out" 'u1'
+
+# 非法凭据 JSON
+eq "非法凭据 JSON 退出码=2" "$(echo 'not-json' | ( api_main outbound set VLESS-REALITY-39049.json --server 1.1.1.1 --port 1 --tag t --auth-stdin ) >/dev/null 2>&1; echo $?)" "2"
+
+# --dry-run 不落盘
+snapshot=$(cat "$conf")
+out=$(run outbound set VLESS-REALITY-39049.json --type socks --server 10.0.0.11 --port 1082 --tag isp-socks-dry --dry-run)
+has "dry-run 标记" "$out" '"dry_run":true'
+has "dry-run 给出 diff" "$out" '"diff":'
+eq "dry-run 未改文件" "$(cat "$conf")" "$snapshot"
+
+# check 失败 → 不落盘
+snapshot=$(cat "$conf")
+out=$(FAKE_CHECK_RC=1 run outbound set VLESS-REALITY-39049.json --type socks --server 10.0.0.12 --port 1083 --tag isp-socks-bad)
+has "check 失败返回 CHECK_FAILED" "$out" '"code":"CHECK_FAILED"'
+eq "check 失败未改文件" "$(cat "$conf")" "$snapshot"
+
+# unset
+out=$(run outbound unset VLESS-REALITY-39049.json --tag isp-socks-test)
+has "unset applied" "$out" '"applied":true'
+out=$(run get VLESS-REALITY-39049.json '[.outbounds[] | select(.tag=="isp-socks-test")]|length')
+has "unset 后出站已移除" "$out" '0'
+out=$(run get VLESS-REALITY-39049.json '[.route.rules[] | select(.outbound=="isp-socks-test")]|length')
+has "unset 后 route 规则已清理" "$out" '0'
+
+# 备份目录卫生：不得写进 conf 目录
+eq "conf 目录只有夹具那一个 .bak（脚本没写进 conf）" "$(ls "$is_conf_dir" | grep -c '\.bak$')" "1"
+if ls "$is_backup_dir"/*.bak >/dev/null 2>&1; then ok "backup 目录里有 .bak 文件"; else no "backup 目录里有 .bak 文件" "空"; fi
+[[ -d $is_backup_dir ]] && ok "backup 目录已创建" || no "backup 目录已创建" "$is_backup_dir 不存在"
+
 
 # ---------------------------------------------------------------- 汇总
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$pass" "$fail"

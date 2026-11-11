@@ -5,7 +5,7 @@
 # 设计原则（见 proxyAIO/docs/team/singbox-fork-plan.md）：
 #   1. 人类交互零变化：本文件只在 `sb api ...` 时被 `load`，人类子命令一行不改。
 #   2. stdout 只输出一个 JSON 对象；人类提示一律走 stderr。
-#   3. 退出码是契约：0 成功 / 2 需要交互但当前非交互 / 3 校验失败 / 4 未找到 / 1 其它。
+#   3. 退出码是契约：0 成功 / 2 需要交互或参数不足 / 3 校验或执行失败 / 4 未找到 / 1 其它。
 #   4. 凭据只走 stdin，永不进 argv、永不回显、永不写日志。
 
 is_fork_ver="v1.20-proxyaio.1"
@@ -15,7 +15,6 @@ is_backup_dir=$is_core_dir/backup
 # ---------------------------------------------------------------- 输出与退出码
 
 api_ok() {
-    # api_ok <cmd> <data-json>
     if [[ $is_api_has_jq ]]; then
         jq -cn --arg cmd "$1" --argjson data "${2:-null}" '{ok:true,cmd:$cmd,data:$data,warnings:[]}'
     else
@@ -24,28 +23,11 @@ api_ok() {
     exit 0
 }
 
-api_warn_ok() {
-    # api_warn_ok <cmd> <data-json> <warning...>
-    local cmd=$1 data=$2
-    shift 2
-    local warnings="[]"
-    if [[ $is_api_has_jq && $# -gt 0 ]]; then
-        warnings=$(printf '%s\n' "$@" | jq -R . | jq -sc .)
-    fi
-    if [[ $is_api_has_jq ]]; then
-        jq -cn --arg cmd "$cmd" --argjson data "${data:-null}" --argjson w "$warnings" '{ok:true,cmd:$cmd,data:$data,warnings:$w}'
-    else
-        printf '{"ok":true,"cmd":"%s","data":%s,"warnings":%s}\n' "$cmd" "${data:-null}" "$warnings"
-    fi
-    exit 0
-}
-
 api_error() {
-    # api_error <exit-code> <CODE> <message> [hint]
     local code=$1 name=$2 message=$3 hint=${4:-}
     if [[ $is_api_has_jq ]]; then
         jq -cn --arg cmd "${is_api_cmd:-api}" --arg code "$name" --arg msg "$message" --arg hint "$hint" \
-            '{ok:false,cmd:$cmd,code:$code,message:$msg,hint:(if $hint=="" then null else $hint end)}' >&1
+            '{ok:false,cmd:$cmd,code:$code,message:$msg,hint:(if $hint=="" then null else $hint end)}'
     else
         printf '{"ok":false,"cmd":"%s","code":"%s","message":"%s"}\n' "${is_api_cmd:-api}" "$name" "$message"
     fi
@@ -59,9 +41,9 @@ api_need_jq() {
 
 # ---------------------------------------------------------------- 工具函数
 
-api__have() {
-    command -v "$1" >/dev/null 2>&1
-}
+api__have() { command -v "$1" >/dev/null 2>&1; }
+
+api__now() { date +%Y%m%d-%H%M%S; }
 
 # 解析 conf 路径：复用 core.sh 的 conf_candidates（精确优先、只认 *.json）
 api_resolve_conf() {
@@ -150,6 +132,23 @@ api_derived() {
     }' "$path"
 }
 
+api__restart_core() {
+    local state
+    if [[ $is_systemd ]]; then
+        systemctl restart $is_core >/dev/null 2>&1
+        sleep 1
+        state=$(systemctl is-active $is_core 2>/dev/null | head -n1)
+    elif [[ $is_openrc ]]; then
+        rc-service $is_core restart >/dev/null 2>&1
+        sleep 1
+        state=$(api_uptime_state)
+    else
+        return 1
+    fi
+    [[ $state == active || $state == started || $state == running ]] && return 0
+    return 1
+}
+
 # ---------------------------------------------------------------- 子命令
 
 api_cmd_version() {
@@ -162,7 +161,7 @@ api_cmd_version() {
         --arg conf "$is_conf_dir" \
         --arg backup "$is_backup_dir" \
         '{sh_ver:$sh,fork_ver:$fork,core_ver:$core,conf_dir:$conf,backup_dir:$backup,
-          features:["api","version","port-free","restart","check","show","list","get","outbound-set"]}')"
+          features:["api","version","port-free","restart","check","show","list","get","outbound-set","outbound-unset"]}')"
 }
 
 api_cmd_port_free() {
@@ -172,27 +171,14 @@ api_cmd_port_free() {
 }
 
 api_cmd_restart() {
-    local state
-    if [[ $is_systemd ]]; then
-        systemctl restart $is_core >/dev/null 2>&1
-        sleep 1
-        state=$(systemctl is-active $is_core 2>/dev/null | head -n1)
-    elif [[ $is_openrc ]]; then
-        rc-service $is_core restart >/dev/null 2>&1
-        sleep 1
-        state=$(api_uptime_state)
-    else
-        api_error 1 UNSUPPORTED "当前系统不支持服务管理（无 systemctl/rc-service）"
+    if api__restart_core; then
+        api_ok restart "$(jq -cn --arg s "$(api_uptime_state)" '{restarted:true,state:$s}')"
     fi
-    if [[ $state == active || $state == started || $state == running ]]; then
-        api_ok restart "$(jq -cn --arg s "$state" '{restarted:true,state:$s}')"
-    fi
-    api_error 3 RESTART_FAILED "重启后状态: ${state:-unknown}" "journalctl -u $is_core -n 50 --no-pager"
+    api_error 3 RESTART_FAILED "重启后状态: $(api_uptime_state)" "journalctl -u $is_core -n 50 --no-pager"
 }
 
 api_cmd_check() {
-    local file=$1
-    local path
+    local file=$1 path
     path=$(api_resolve_conf "$file") || exit $?
     [[ ! -x $is_core_bin ]] && api_error 1 NO_CORE "核心不存在: $is_core_bin" "sb update --with-core"
 
@@ -246,7 +232,6 @@ api_cmd_show() {
     local derived
     derived=$(api_derived "$path")
     [[ ! $derived ]] && api_error 3 PARSE_FAILED "无法解析配置: $(basename "$path")" "sb api check $file"
-    # 默认只给摘要：不返回 raw，避免凭据随 stdout 进日志/审计
     api_ok show "$(jq -cn --arg file "$(basename "$path")" --argjson derived "$derived" \
         '{file:$file,derived:$derived}')"
 }
@@ -282,9 +267,160 @@ api_cmd_get() {
     api_ok get "$(jq -cn --argjson v "$val" '{value:$v}')"
 }
 
-# Part 3：写入/移除出口配置（凭据走 stdin）
+# ---------------------------------------------------------------- Part 3：写入/移除出口配置
+
+# 把 $2（新内容文件）落到 $1（conf），带备份/校验/可选重启/幂等判定
+# 参数: <path> <work> <tag> <mode> <do_check> <do_restart> <is_dry> <extra-json> [cred-file]
+api__commit_conf() {
+    local path=$1 work=$2 tag=$3 mode=$4 do_check=$5 do_restart=$6 is_dry=$7 extra=${8:-null}
+    local name old_norm new_norm backup="" checked="false" restarted="false"
+    name=$(basename "$path")
+
+    old_norm=$(jq -S -c . "$path" 2>/dev/null)
+    new_norm=$(jq -S -c . "$work" 2>/dev/null)
+    if [[ -n $new_norm && $old_norm == "$new_norm" ]]; then
+        rm -f "$work"
+        api_ok outbound "$(jq -cn --arg f "$name" --arg t "$tag" --arg m "$mode" --argjson extra "$extra" \
+            '{file:$f,outbound_tag:$t,mode:$m,changed:false,applied:false,checked:true,restarted:false,dry_run:false} + $extra')"
+    fi
+
+    if [[ $is_dry -eq 1 ]]; then
+        local diff
+        diff=$(diff <(jq -S . "$path" 2>/dev/null) <(jq -S . "$work" 2>/dev/null) | head -n 60)
+        rm -f "$work"
+        api_ok outbound "$(jq -cn --arg f "$name" --arg t "$tag" --arg m "$mode" --arg d "$diff" --argjson extra "$extra" \
+            '{file:$f,outbound_tag:$t,mode:$m,changed:true,applied:false,checked:false,restarted:false,dry_run:true,diff:$d} + $extra')"
+    fi
+
+    if [[ $do_check -eq 1 && -x $is_core_bin ]]; then
+        local cout crc
+        cout=$($is_core_bin check -c "$work" 2>&1)
+        crc=$?
+        if [[ $crc -ne 0 ]]; then
+            rm -f "$work"
+            api_error 3 CHECK_FAILED "sing-box check 未通过，未做任何改动: $(printf '%s' "$cout" | tail -n 2 | tr '\n' ' ')" "sb api check $name"
+        fi
+        checked="true"
+    fi
+
+    mkdir -p "$is_backup_dir" 2>/dev/null
+    if [[ -d $is_backup_dir ]]; then
+        backup="$is_backup_dir/$name.$(api__now).bak"
+        cp -p "$path" "$backup" 2>/dev/null || backup=""
+    fi
+
+    if ! mv -f "$work" "$path" 2>/dev/null; then
+        api_error 3 WRITE_FAILED "原子替换失败（原文件未改）" "ls -l $is_conf_dir"
+    fi
+
+    if [[ $do_restart -eq 1 ]]; then
+        if api__restart_core; then
+            restarted="true"
+        else
+            api_error 3 RESTART_FAILED "配置已写入但重启失败，请人工检查（备份: ${backup:-无}）" "journalctl -u $is_core -n 50 --no-pager"
+        fi
+    fi
+
+    api_ok outbound "$(jq -cn --arg f "$name" --arg t "$tag" --arg m "$mode" --arg b "$backup" \
+        --arg json_checked "$checked" --arg json_restarted "$restarted" --argjson extra "$extra" \
+        '{file:$f,outbound_tag:$t,mode:$m,changed:true,applied:true,
+          checked:($json_checked=="true"),restarted:($json_restarted=="true"),dry_run:false,
+          backup:(if $b=="" then null else $b end)} + $extra')"
+}
+
 api_cmd_outbound() {
-    api_error 1 NOT_IMPLEMENTED "sb api outbound 尚未实现（Part 3）" "sb api show <file>"
+    local action=${1:-}
+    shift || true
+    case $action in
+    set | unset) ;;
+    "" | help | --help | -h) api_error 2 NEED_INPUT "缺少 outbound 子命令" "sb api outbound set <file> --server H --port P --tag T" ;;
+    *) api_error 2 UNKNOWN_COMMAND "未知的 outbound 子命令: $action" "sb api outbound set|unset" ;;
+    esac
+
+    local file="" type="socks" server="" port="" tag="" auth_stdin=0 rfi=0 do_check=1 do_restart=0 is_dry=0
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+        --type) type=$2; shift 2 ;;
+        --server) server=$2; shift 2 ;;
+        --port) port=$2; shift 2 ;;
+        --tag) tag=$2; shift 2 ;;
+        --auth-stdin) auth_stdin=1; shift ;;
+        --route-from-inbound) rfi=1; shift ;;
+        --no-check) do_check=0; shift ;;
+        --restart) do_restart=1; shift ;;
+        --dry-run) is_dry=1; shift ;;
+        -*) api_error 2 BAD_ARG "未知参数: $1" "sb api outbound help" ;;
+        *) if [[ $file ]]; then api_error 2 BAD_ARG "多余参数: $1" "sb api outbound help"; else file=$1; fi; shift ;;
+        esac
+    done
+
+    [[ ! $file ]] && api_error 2 NEED_INPUT "缺少配置文件参数" "sb api outbound set <file> --tag T"
+    [[ ! $tag ]] && api_error 2 NEED_INPUT "缺少 --tag" "sb api outbound set <file> --tag isp-socks-39049"
+    api_need_jq
+
+    local path
+    path=$(api_resolve_conf "$file") || exit $?
+
+    local work cred_file
+    work=$(mktemp 2>/dev/null || mktemp -t sbwork)
+    cred_file=$(mktemp 2>/dev/null || mktemp -t sbcred)
+    chmod 600 "$cred_file" 2>/dev/null
+    printf '{}' >"$cred_file"
+
+    if [[ $action == set && $auth_stdin -eq 1 ]]; then
+        cat >"$cred_file"
+        if ! jq -e . "$cred_file" >/dev/null 2>&1; then
+            rm -f "$work" "$cred_file"
+            api_error 2 BAD_CREDENTIAL 'stdin 不是合法 JSON（应为 {"username":..,"password":..}）' "echo '{\"username\":\"u\",\"password\":\"p\"}' | sb api outbound set ..."
+        fi
+    fi
+
+    if [[ $action == set ]]; then
+        if [[ ! $server || ! $port ]]; then
+            rm -f "$work" "$cred_file"
+            api_error 2 NEED_INPUT "缺少 --server / --port" "sb api outbound set <file> --server 1.2.3.4 --port 51524 --tag isp-socks-<port>"
+        fi
+        if ! jq -c --arg tag "$tag" --arg type "$type" --arg server "$server" --arg sport "$port" --argjson rfi "$rfi" \
+            --slurpfile cred "$cred_file" '
+            ($cred[0] // {}) as $c
+            | .outbounds = (((.outbounds // []) | map(select(.tag != $tag))) + [{
+                type: $type,
+                tag: $tag,
+                server: $server,
+                server_port: ($sport | tonumber),
+                version: "5",
+                username: ($c.username // null),
+                password: ($c.password // null)
+              } | with_entries(select(.value != null))])
+            | (if $rfi == 1 then
+                 (.inbounds[0].tag) as $inb
+                 | .route = ((.route // {}) |
+                     .rules = (((.rules // []) | map(select((((.inbound // []) | index($inb)) | not)))) +
+                               [{"inbound": [$inb], "action": "route", "outbound": $tag}]))
+               else . end)
+            | (if ((.route.final // null) == null) then .route.final = "direct" else . end)
+            ' "$path" >"$work" 2>/dev/null; then
+            rm -f "$work" "$cred_file"
+            api_error 3 TRANSFORM_FAILED "配置变换失败（原文件未改）" "sb api check $(basename "$path")"
+        fi
+        local extra
+        extra=$(jq -cn --argjson rfi "$rfi" '{route_from_inbound:($rfi==1)}')
+        rm -f "$cred_file"
+        api__commit_conf "$path" "$work" "$tag" "set" "$do_check" "$do_restart" "$is_dry" "$extra"
+    else
+        if ! jq -c --arg tag "$tag" '
+            .outbounds = ((.outbounds // []) | map(select(.tag != $tag)))
+            | (if ((.route.rules // []) | length) > 0 then
+                 .route.rules = ((.route.rules // []) | map(select((.outbound // null) != $tag)))
+               else . end)
+            | (if ((.route.final // null) == $tag) then .route.final = "direct" else . end)
+            ' "$path" >"$work" 2>/dev/null; then
+            rm -f "$work" "$cred_file"
+            api_error 3 TRANSFORM_FAILED "配置变换失败（原文件未改）" "sb api check $(basename "$path")"
+        fi
+        rm -f "$cred_file"
+        api__commit_conf "$path" "$work" "$tag" "unset" "$do_check" "$do_restart" "$is_dry" '{"route_from_inbound":false}'
+    fi
 }
 
 api_cmd_help() {
@@ -293,12 +429,14 @@ sb api —— 机器通道（输出单个 JSON 对象，退出码即契约）
 
   sb api version                  版本与能力（含 fork_ver）
   sb api list                     列出全部配置文件及其摘要
-  sb api show <file|tag> [--raw]  整份配置（--raw 时只有原文 JSON）
+  sb api show <file|tag> [--raw]  整份配置（默认只给 derived 摘要；--raw 才吐原文）
   sb api get <file> <jq路径>      任意路径取值（--default X 兜底）
   sb api check <file>             sing-box check 结构化结果
   sb api port free                分配空闲端口
   sb api restart                  重启并返回 is-active
-  sb api outbound set|unset ...   写入/移除出口配置（凭据走 stdin）
+  sb api outbound set <file> --server H --port P --tag T [--auth-stdin]
+                     [--route-from-inbound] [--no-check] [--restart] [--dry-run]
+  sb api outbound unset <file> --tag T [--no-check] [--restart] [--dry-run]
 
 退出码: 0 成功 / 2 需要交互或参数不足 / 3 校验或执行失败 / 4 未找到 / 1 其它
 EOF
@@ -314,7 +452,7 @@ api_main() {
     case $1 in
     version | --version | -v) api_cmd_version ;;
     port)
-        case $2 in
+        case ${2:-} in
         free | get) api_cmd_port_free ;;
         *) api_error 2 NEED_INPUT "未知的 port 子命令: ${2:-}" "sb api port free" ;;
         esac
