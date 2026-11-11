@@ -722,6 +722,12 @@ uninstall() {
 # manage run status
 manage() {
     [[ $is_dont_auto_exit ]] && return
+    # proxyaio fork: sb api 批量操作时由调用方统一重启（--restart 显式触发）
+    if [[ $is_api_no_restart ]]; then
+        case $1 in
+        3 | r | restart) return ;;
+        esac
+    fi
     case $1 in
     1 | start)
         is_do=start

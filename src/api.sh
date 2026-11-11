@@ -8,7 +8,7 @@
 #   3. 退出码是契约：0 成功 / 2 需要交互或参数不足 / 3 校验或执行失败 / 4 未找到 / 1 其它。
 #   4. 凭据只走 stdin，永不进 argv、永不回显、永不写日志。
 
-is_fork_ver="v1.20-proxyaio.1"
+is_fork_ver="v1.20-proxyaio.2"
 is_api_mode=1
 is_backup_dir=$is_core_dir/backup
 
@@ -267,6 +267,96 @@ api_cmd_get() {
     api_ok get "$(jq -cn --argjson v "$val" '{value:$v}')"
 }
 
+# ---------------------------------------------------------------- Part 4：非交互 add / del
+
+# 生成节点：调用脚本自己的 add（人类同一套逻辑），但
+#   1) 人类输出全部重定向到 stderr（保证 stdout 只有 JSON）
+#   2) stdin 接 /dev/null —— 参数不全时立刻失败，绝不挂住
+#   3) 默认不重启（is_api_no_restart 由 manage() 识别），--restart 才重启
+api_cmd_add() {
+    local alias=${1:-}
+    [[ ! $alias ]] && api_error 2 NEED_INPUT "缺少协议别名（如 reality / ws / hy2 / ss）" "sb api add reality auto"
+    shift || true
+
+    local do_restart=0 passthru=() a
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+        --restart) do_restart=1; shift ;;
+        --no-restart) do_restart=0; shift ;;
+        -*) api_error 2 BAD_ARG "未知参数: $1" "sb api add <alias> [args...]" ;;
+        *) passthru+=("$1"); shift ;;
+        esac
+    done
+
+    local before after added rc
+    before=$(api_conf_list | sort)
+    (
+        is_api_no_restart=1
+        add "$alias" "${passthru[@]}" >&2
+    ) </dev/null
+    rc=$?
+    after=$(api_conf_list | sort)
+
+    added=$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") 2>/dev/null | sed '/^$/d')
+    if [[ $rc -ne 0 && ! $added ]]; then
+        api_error 3 ADD_FAILED "sb add $alias 失败（退出码 $rc，原因见 stderr）" "sb api add $alias ${passthru[*]:-auto}"
+    fi
+    [[ ! $added ]] && api_error 3 ADD_FAILED "未生成新的配置文件（检查参数或看 stderr）" "sb api list"
+    if [[ $(printf '%s\n' "$added" | wc -l) -ne 1 ]]; then
+        api_error 3 ADD_AMBIGUOUS "一次生成了多个配置文件: $(echo $added)" "sb api list"
+    fi
+
+    local file=$added path=$is_conf_dir/$added restarted="false"
+    if [[ $do_restart -eq 1 ]]; then
+        api__restart_core || api_error 3 RESTART_FAILED "配置已生成但重启失败" "journalctl -u $is_core -n 50 --no-pager"
+        restarted="true"
+    fi
+
+    api_ok add "$(jq -cn --arg f "$file" --argjson re "$restarted" --slurpfile c "$path" \
+        '{file:$f,
+          tag:($c[0].inbounds[0].tag // null),
+          port:($c[0].inbounds[0].listen_port // null),
+          protocol:($c[0].inbounds[0].type // null),
+          restarted:$re}')"
+}
+
+# 删除节点：精确解析 → 备份 → rm → 校验 → 可选重启。不碰人类 del 的交互路径。
+api_cmd_del() {
+    local file="" do_restart=0
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+        --restart) do_restart=1; shift ;;
+        --no-restart) do_restart=0; shift ;;
+        -*) api_error 2 BAD_ARG "未知参数: $1" "sb api del <file|tag>" ;;
+        *) if [[ $file ]]; then api_error 2 BAD_ARG "多余参数: $1" "sb api del <file|tag>"; else file=$1; fi; shift ;;
+        esac
+    done
+    [[ ! $file ]] && api_error 2 NEED_INPUT "缺少配置文件参数" "sb api del <file|tag>"
+
+    local path name backup="" restarted="false"
+    path=$(api_resolve_conf "$file") || exit $?
+    name=$(basename "$path")
+
+    mkdir -p "$is_backup_dir" 2>/dev/null
+    if [[ -d $is_backup_dir ]]; then
+        backup="$is_backup_dir/$name.$(api__now).del.bak"
+        cp -p "$path" "$backup" 2>/dev/null || backup=""
+    fi
+
+    rm -f "$path" 2>/dev/null
+    if [[ -f $path ]]; then
+        api_error 3 DELETE_FAILED "删除失败，文件仍存在" "ls -l $is_conf_dir"
+    fi
+
+    if [[ $do_restart -eq 1 ]]; then
+        api__restart_core || api_error 3 RESTART_FAILED "已删除但重启失败" "journalctl -u $is_core -n 50 --no-pager"
+        restarted="true"
+    fi
+
+    api_ok del "$(jq -cn --arg f "$name" --arg b "$backup" --argjson re "$restarted" --argjson left "$(api_conf_list | wc -l)" \
+        '{file:$f,deleted:true,restarted:$re,remaining_files:$left,backup:(if $b=="" then null else $b end)}')"
+}
+
 # ---------------------------------------------------------------- Part 3：写入/移除出口配置
 
 # 把 $2（新内容文件）落到 $1（conf），带备份/校验/可选重启/幂等判定
@@ -434,6 +524,8 @@ sb api —— 机器通道（输出单个 JSON 对象，退出码即契约）
   sb api check <file>             sing-box check 结构化结果
   sb api port free                分配空闲端口
   sb api restart                  重启并返回 is-active
+  sb api add <alias> [args...]    非交互新建节点（--restart 才重启），输出 file/tag/port/protocol
+  sb api del <file|tag>           精确删除（备份 + 校验，--restart 才重启）
   sb api outbound set <file> --server H --port P --tag T [--auth-stdin]
                      [--route-from-inbound] [--no-check] [--restart] [--dry-run]
   sb api outbound unset <file> --tag T [--no-check] [--restart] [--dry-run]
@@ -458,6 +550,8 @@ api_main() {
         esac
         ;;
     restart) api_cmd_restart ;;
+    add) api_cmd_add "${@:2}" ;;
+    del) api_cmd_del "${@:2}" ;;
     check) api_cmd_check "${2:-}" ;;
     list) api_cmd_list ;;
     show) api_cmd_show "${2:-}" "${@:3}" ;;

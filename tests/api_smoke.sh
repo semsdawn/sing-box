@@ -136,7 +136,7 @@ has "未知子命令返回 UNKNOWN_COMMAND" "$out" '"code":"UNKNOWN_COMMAND"'
 eq "show 缺参数退出码=2" "$(rc_of show)" "2"
 
 out=$(run version)
-has "version 带 fork_ver" "$out" '"fork_ver":"v1.20-proxyaio.1"'
+has "version 带 fork_ver" "$out" '"fork_ver":"v1.20-proxyaio.2"'
 has "version 带 core_ver" "$out" '"core_ver":"1.14.4"'
 has "version 带 features" "$out" '"outbound-set"'
 
@@ -202,6 +202,29 @@ eq "conf 目录只有夹具那一个 .bak（脚本没写进 conf）" "$(ls "$is_
 if ls "$is_backup_dir"/*.bak >/dev/null 2>&1; then ok "backup 目录里有 .bak 文件"; else no "backup 目录里有 .bak 文件" "空"; fi
 [[ -d $is_backup_dir ]] && ok "backup 目录已创建" || no "backup 目录已创建" "$is_backup_dir 不存在"
 
+
+# ---------------------------------------------------------------- Part 4: add / del
+
+# 测试桩：模拟脚本内部的 add()（只负责生成一个 conf 文件）
+add() {
+    cat >"$is_conf_dir/VLESS-REALITY-50000.json" <<'EOJ'
+{"inbounds":[{"type":"vless","tag":"VLESS-REALITY-50000.json","listen_port":50000}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[]}}
+EOJ
+}
+
+out=$(run add reality 50000)
+has "api add 返回文件名" "$out" '"file":"VLESS-REALITY-50000.json"'
+has "api add 返回端口" "$out" '"port":50000'
+has "api add 返回协议" "$out" '"protocol":"vless"'
+has "api add 默认不重启" "$out" '"restarted":false'
+lacks "api add 的 stdout 只有 JSON（人类输出已转 stderr）" "$out" "-------------" 
+
+out=$(run del VLESS-REALITY-50000.json)
+has "api del 删除成功" "$out" '"deleted":true'
+has "api del 返回剩余文件数" "$out" '"remaining_files":'
+eq "api del 后文件消失" "$(ls "$is_conf_dir" | grep -c 50000)" "0"
+eq "api del 找不到退出码=4" "$(rc_of del nosuchfile)" "4"
+eq "api del 缺参数退出码=2" "$(rc_of del)" "2"
 
 # ---------------------------------------------------------------- 汇总
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$pass" "$fail"
