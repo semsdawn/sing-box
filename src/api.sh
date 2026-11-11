@@ -127,7 +127,8 @@ api_derived() {
                 server_name: ($t[0].server_name // null),
                 has_private_key: (((($t[0].reality) // {}).private_key) != null),
                 has_public_key: (((($t[0].reality) // {}).public_key) != null),
-                short_id: (((($t[0].reality) // {}).short_id) // null)
+                short_id: (((((($t[0].reality) // {}).short_id) // null)
+                    | if type == "array" then (if length > 0 then .[0] else "" end) else . end))
             } else null end)
     }' "$path"
 }
@@ -161,7 +162,7 @@ api_cmd_version() {
         --arg conf "$is_conf_dir" \
         --arg backup "$is_backup_dir" \
         '{sh_ver:$sh,fork_ver:$fork,core_ver:$core,conf_dir:$conf,backup_dir:$backup,
-          features:["api","version","port-free","restart","check","show","list","get","outbound-set","outbound-unset"]}')"
+          features:["api","version","port-free","restart","check","show","list","get","add","del","outbound-set","outbound-unset"]}')"
 }
 
 api_cmd_port_free() {
@@ -278,30 +279,41 @@ api_cmd_add() {
     [[ ! $alias ]] && api_error 2 NEED_INPUT "缺少协议别名（如 reality / ws / hy2 / ss）" "sb api add reality auto"
     shift || true
 
-    local do_restart=0 passthru=() a
+    local do_restart=0 passthru=() addr=""
     while [[ $# -gt 0 ]]; do
         case $1 in
         --restart) do_restart=1; shift ;;
         --no-restart) do_restart=0; shift ;;
-        -*) api_error 2 BAD_ARG "未知参数: $1" "sb api add <alias> [args...]" ;;
+        --addr)
+            # 面板已知机器 IP 时显式传入，免去脚本去外网取 IP（内网/被墙机器会失败）
+            addr=$2
+            shift 2
+            ;;
+        -*) api_error 2 BAD_ARG "未知参数: $1" "sb api add <alias> [args...] [--addr IP]" ;;
         *) passthru+=("$1"); shift ;;
         esac
     done
 
-    local before after added rc
+    local before after added rc errfile
+    errfile=$(mktemp 2>/dev/null || mktemp -t sbadd)
     before=$(api_conf_list | sort)
     (
         is_api_no_restart=1
-        add "$alias" "${passthru[@]}" >&2
+        [[ $addr ]] && ip=$addr
+        add "$alias" "${passthru[@]}" >"$errfile" 2>&1
     ) </dev/null
     rc=$?
+    cat "$errfile" >&2 2>/dev/null
     after=$(api_conf_list | sort)
 
     added=$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") 2>/dev/null | sed '/^$/d')
-    if [[ $rc -ne 0 && ! $added ]]; then
-        api_error 3 ADD_FAILED "sb add $alias 失败（退出码 $rc，原因见 stderr）" "sb api add $alias ${passthru[*]:-auto}"
+    if [[ ! $added ]]; then
+        local tailmsg
+        tailmsg=$(tail -n 3 "$errfile" 2>/dev/null | tr '\n' ' ')
+        rm -f "$errfile"
+        api_error 3 ADD_FAILED "sb add $alias 未生成配置文件（rc=$rc）: ${tailmsg:-无输出}" "sb api add $alias ${passthru[*]:-auto} --addr <机器IP>"
     fi
-    [[ ! $added ]] && api_error 3 ADD_FAILED "未生成新的配置文件（检查参数或看 stderr）" "sb api list"
+    rm -f "$errfile"
     if [[ $(printf '%s\n' "$added" | wc -l) -ne 1 ]]; then
         api_error 3 ADD_AMBIGUOUS "一次生成了多个配置文件: $(echo $added)" "sb api list"
     fi
