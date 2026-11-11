@@ -280,19 +280,44 @@ api_cmd_add() {
     shift || true
 
     local do_restart=0 passthru=() addr=""
+    local ob_server="" ob_port="" ob_tag="" ob_auth_stdin=0 ob_rfi=0 ob_check=1 is_dry=0
     while [[ $# -gt 0 ]]; do
         case $1 in
         --restart) do_restart=1; shift ;;
         --no-restart) do_restart=0; shift ;;
+        --outbound-server) ob_server=$2; shift 2 ;;
+        --outbound-port) ob_port=$2; shift 2 ;;
+        --outbound-tag) ob_tag=$2; shift 2 ;;
+        --auth-stdin) ob_auth_stdin=1; shift ;;
+        --route-from-inbound) ob_rfi=1; shift ;;
+        --no-check) ob_check=0; shift ;;
+        --dry-run) is_dry=1; shift ;;
         --addr)
             # 面板已知机器 IP 时显式传入，免去脚本去外网取 IP（内网/被墙机器会失败）
             addr=$2
             shift 2
             ;;
-        -*) api_error 2 BAD_ARG "未知参数: $1" "sb api add <alias> [args...] [--addr IP]" ;;
+        -*) api_error 2 BAD_ARG "未知参数: $1" "sb api add <alias> [args...] [--addr IP] [--outbound-server H --outbound-port P --outbound-tag T --auth-stdin --route-from-inbound]" ;;
         *) passthru+=("$1"); shift ;;
         esac
     done
+
+    # 需要配出口时，凭据只走 stdin（600 临时文件，用完即删）
+    local cred_file=""
+    if [[ $ob_server ]]; then
+        [[ ! $ob_port || ! $ob_tag ]] && api_error 2 NEED_INPUT "配出口需要 --outbound-port 与 --outbound-tag" "sb api add reality auto --outbound-server 1.2.3.4 --outbound-port 51524 --outbound-tag isp-socks-<inbound端口>"
+        api_need_jq
+        cred_file=$(mktemp 2>/dev/null || mktemp -t sbcred)
+        chmod 600 "$cred_file" 2>/dev/null
+        printf '{}' >"$cred_file"
+        if [[ $ob_auth_stdin -eq 1 ]]; then
+            cat >"$cred_file"
+            if ! jq -e . "$cred_file" >/dev/null 2>&1; then
+                rm -f "$cred_file"
+                api_error 2 BAD_CREDENTIAL 'stdin 不是合法 JSON（应为 {"username":..,"password":..}）' "printf '{\"username\":\"u\",\"password\":\"p\"}' | sb api add ... --auth-stdin"
+            fi
+        fi
+    fi
 
     local before after added rc errfile
     errfile=$(mktemp 2>/dev/null || mktemp -t sbadd)
@@ -310,26 +335,61 @@ api_cmd_add() {
     if [[ ! $added ]]; then
         local tailmsg
         tailmsg=$(tail -n 3 "$errfile" 2>/dev/null | tr '\n' ' ')
-        rm -f "$errfile"
+        rm -f "$errfile" "$cred_file"
         api_error 3 ADD_FAILED "sb add $alias 未生成配置文件（rc=$rc）: ${tailmsg:-无输出}" "sb api add $alias ${passthru[*]:-auto} --addr <机器IP>"
     fi
     rm -f "$errfile"
     if [[ $(printf '%s\n' "$added" | wc -l) -ne 1 ]]; then
+        rm -f "$cred_file"
         api_error 3 ADD_AMBIGUOUS "一次生成了多个配置文件: $(echo $added)" "sb api list"
     fi
 
-    local file=$added path=$is_conf_dir/$added restarted="false"
+    local file=$added path=$is_conf_dir/$added restarted="false" out_json="null"
+
+    # 一次性把出口配好（建节点 + 写 socks 出站 + 路由），任一步失败都不重启
+    if [[ $ob_server ]]; then
+        local work
+        work=$(mktemp 2>/dev/null || mktemp -t sbwork)
+        if ! api__transform_outbound "$path" "$work" "$ob_tag" "socks" "$ob_server" "$ob_port" "$ob_rfi" "$cred_file" 2>/dev/null; then
+            rm -f "$work" "$cred_file"
+            api_error 3 TRANSFORM_FAILED "出口配置变换失败（节点已建、出口未写入）" "sb api outbound set $file --server $ob_server --port $ob_port --tag $ob_tag"
+        fi
+        rm -f "$cred_file"
+        if [[ $is_dry -eq 1 ]]; then
+            local d
+            d=$(diff <(jq -S . "$path" 2>/dev/null) <(jq -S . "$work" 2>/dev/null) | head -n 40)
+            rm -f "$work"
+            out_json=$(jq -cn --arg d "$d" '{dry_run:true,applied:false,diff:$d}')
+        else
+            if [[ $ob_check -eq 1 && -x $is_core_bin ]]; then
+                local cout
+                cout=$($is_core_bin check -c "$work" 2>&1)
+                if [[ $? -ne 0 ]]; then
+                    rm -f "$work"
+                    api_error 3 CHECK_FAILED "sing-box check 未通过（节点已建、出口未写入）: $(printf '%s' "$cout" | tail -n 2 | tr '\n' ' ')" "sb api check $file"
+                fi
+            fi
+            if ! mv -f "$work" "$path" 2>/dev/null; then
+                rm -f "$work"
+                api_error 3 WRITE_FAILED "出口写入失败（节点已建、出口未写入）" "sb api show $file"
+            fi
+            out_json=$(jq -cn --arg t "$ob_tag" --arg s "$ob_server" --argjson p "$ob_port" --argjson rfi "$ob_rfi" \
+                '{tag:$t,server:$s,server_port:$p,route_from_inbound:($rfi==1),applied:true}')
+        fi
+    fi
+
     if [[ $do_restart -eq 1 ]]; then
         api__restart_core || api_error 3 RESTART_FAILED "配置已生成但重启失败" "journalctl -u $is_core -n 50 --no-pager"
         restarted="true"
     fi
 
-    api_ok add "$(jq -cn --arg f "$file" --argjson re "$restarted" --slurpfile c "$path" \
+    api_ok add "$(jq -cn --arg f "$file" --argjson re "$restarted" --argjson ob "$out_json" --slurpfile c "$path" \
         '{file:$f,
           tag:($c[0].inbounds[0].tag // null),
           port:($c[0].inbounds[0].listen_port // null),
           protocol:($c[0].inbounds[0].type // null),
-          restarted:$re}')"
+          restarted:$re,
+          outbound:$ob}')"
 }
 
 # 删除节点：精确解析 → 备份 → rm → 校验 → 可选重启。不碰人类 del 的交互路径。
@@ -370,6 +430,32 @@ api_cmd_del() {
 }
 
 # ---------------------------------------------------------------- Part 3：写入/移除出口配置
+
+# 把 outbound 变换应用到 $src，输出到 $out（不改原文件）
+# 参数: <src> <out> <tag> <type> <server> <port> <rfi 0|1> <cred-file>
+api__transform_outbound() {
+    local src=$1 out=$2 tag=$3 type=$4 server=$5 port=$6 rfi=$7 cred=$8
+    jq -c --arg tag "$tag" --arg type "$type" --arg server "$server" --arg sport "$port" \
+        --argjson rfi "$rfi" --slurpfile cred "$cred" '
+        ($cred[0] // {}) as $c
+        | .outbounds = (((.outbounds // []) | map(select(.tag != $tag))) + [{
+            type: $type,
+            tag: $tag,
+            server: $server,
+            server_port: ($sport | tonumber),
+            version: "5",
+            username: ($c.username // null),
+            password: ($c.password // null)
+          } | with_entries(select(.value != null))])
+        | (if $rfi == 1 then
+             (.inbounds[0].tag) as $inb
+             | .route = ((.route // {}) |
+                 .rules = (((.rules // []) | map(select((((.inbound // []) | index($inb)) | not)))) +
+                           [{"inbound": [$inb], "action": "route", "outbound": $tag}]))
+           else . end)
+        | (if ((.route.final // null) == null) then .route.final = "direct" else . end)
+        ' "$src" >"$out"
+}
 
 # 把 $2（新内容文件）落到 $1（conf），带备份/校验/可选重启/幂等判定
 # 参数: <path> <work> <tag> <mode> <do_check> <do_restart> <is_dry> <extra-json> [cred-file]
@@ -482,26 +568,7 @@ api_cmd_outbound() {
             rm -f "$work" "$cred_file"
             api_error 2 NEED_INPUT "缺少 --server / --port" "sb api outbound set <file> --server 1.2.3.4 --port 51524 --tag isp-socks-<port>"
         fi
-        if ! jq -c --arg tag "$tag" --arg type "$type" --arg server "$server" --arg sport "$port" --argjson rfi "$rfi" \
-            --slurpfile cred "$cred_file" '
-            ($cred[0] // {}) as $c
-            | .outbounds = (((.outbounds // []) | map(select(.tag != $tag))) + [{
-                type: $type,
-                tag: $tag,
-                server: $server,
-                server_port: ($sport | tonumber),
-                version: "5",
-                username: ($c.username // null),
-                password: ($c.password // null)
-              } | with_entries(select(.value != null))])
-            | (if $rfi == 1 then
-                 (.inbounds[0].tag) as $inb
-                 | .route = ((.route // {}) |
-                     .rules = (((.rules // []) | map(select((((.inbound // []) | index($inb)) | not)))) +
-                               [{"inbound": [$inb], "action": "route", "outbound": $tag}]))
-               else . end)
-            | (if ((.route.final // null) == null) then .route.final = "direct" else . end)
-            ' "$path" >"$work" 2>/dev/null; then
+        if ! api__transform_outbound "$path" "$work" "$tag" "$type" "$server" "$port" "$rfi" "$cred_file" 2>/dev/null; then
             rm -f "$work" "$cred_file"
             api_error 3 TRANSFORM_FAILED "配置变换失败（原文件未改）" "sb api check $(basename "$path")"
         fi
@@ -536,7 +603,9 @@ sb api —— 机器通道（输出单个 JSON 对象，退出码即契约）
   sb api check <file>             sing-box check 结构化结果
   sb api port free                分配空闲端口
   sb api restart                  重启并返回 is-active
-  sb api add <alias> [args...]    非交互新建节点（--restart 才重启），输出 file/tag/port/protocol
+  sb api add <alias> [args...] [--addr IP] [--outbound-server H --outbound-port P --outbound-tag T
+                                [--auth-stdin] [--route-from-inbound]]
+                                  非交互新建节点，可同时把出口一次配好（--restart 才重启）
   sb api del <file|tag>           精确删除（备份 + 校验，--restart 才重启）
   sb api outbound set <file> --server H --port P --tag T [--auth-stdin]
                      [--route-from-inbound] [--no-check] [--restart] [--dry-run]

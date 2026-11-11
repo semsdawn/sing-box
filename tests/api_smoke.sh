@@ -205,10 +205,12 @@ if ls "$is_backup_dir"/*.bak >/dev/null 2>&1; then ok "backup 目录里有 .bak 
 
 # ---------------------------------------------------------------- Part 4: add / del
 
-# 测试桩：模拟脚本内部的 add()（只负责生成一个 conf 文件）
+# 测试桩：模拟脚本内部的 add()（按端口生成一个 conf 文件）
 add() {
-    cat >"$is_conf_dir/VLESS-REALITY-50000.json" <<'EOJ'
-{"inbounds":[{"type":"vless","tag":"VLESS-REALITY-50000.json","listen_port":50000}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[]}}
+    local alias=$1 port=${2:-50000}
+    [[ $port == auto || -z $port ]] && port=50000
+    cat >"$is_conf_dir/VLESS-REALITY-$port.json" <<EOJ
+{"inbounds":[{"type":"vless","tag":"VLESS-REALITY-$port.json","listen_port":$port}],"outbounds":[{"type":"direct","tag":"direct"}],"route":{"rules":[]}}
 EOJ
 }
 
@@ -225,6 +227,20 @@ has "api del 返回剩余文件数" "$out" '"remaining_files":'
 eq "api del 后文件消失" "$(ls "$is_conf_dir" | grep -c 50000)" "0"
 eq "api del 找不到退出码=4" "$(rc_of del nosuchfile)" "4"
 eq "api del 缺参数退出码=2" "$(rc_of del)" "2"
+
+# ---- Part 4b: add 同时配出口（一次性） ----
+out=$(echo '{"username":"uo","password":"po"}' | run add reality 50001 --addr 1.2.3.4 --outbound-server 10.0.0.9 --outbound-port 1080 --outbound-tag isp-socks-50001 --auth-stdin --route-from-inbound)
+has "add+outbound 返回文件" "$out" '"file":"VLESS-REALITY-50001.json"'
+has "add+outbound 标记 applied" "$out" '"applied":true'
+has "add+outbound 带 route_from_inbound" "$out" '"route_from_inbound":true'
+lacks "add+outbound 不回显口令" "$out" '"po"'
+out=$(run get VLESS-REALITY-50001.json '[.outbounds[]|select(.tag=="isp-socks-50001")|.username]|.[0]')
+has "add+outbound 凭据已写入" "$out" 'uo'
+out=$(run get VLESS-REALITY-50001.json '[.route.rules[]|select(.outbound=="isp-socks-50001")]|length')
+has "add+outbound 路由已写入" "$out" '1'
+
+# 缺 --outbound-port 应报参数不足
+eq "add+outbound 缺 port 退出码=2" "$(rc_of add reality 50002 --outbound-server 1.1.1.1 --outbound-tag t)" "2"
 
 # ---------------------------------------------------------------- 汇总
 printf '\n%s: %d passed, %d failed\n' "$(basename "$0")" "$pass" "$fail"
