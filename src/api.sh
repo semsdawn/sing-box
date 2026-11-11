@@ -8,7 +8,7 @@
 #   3. 退出码是契约：0 成功 / 2 需要交互或参数不足 / 3 校验或执行失败 / 4 未找到 / 1 其它。
 #   4. 凭据只走 stdin，永不进 argv、永不回显、永不写日志。
 
-is_fork_ver="v1.20-proxyaio.2"
+is_fork_ver="v1.20-proxyaio.3"
 is_api_mode=1
 is_backup_dir=$is_core_dir/backup
 
