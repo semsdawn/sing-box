@@ -148,3 +148,10 @@ sb api outbound set|unset ...  # 写入/移除出口配置（凭据只走 stdin�
 - **凭据永不进 argv、永不回显、永不写日志**；需要认证的操作从 stdin 读 JSON。
 - 备份与临时文件落 `/etc/sing-box/backup/`，**不写入 conf 目录**（`sb` 会枚举 conf 目录，混入 `.bak` 会导致交互式选择失败）。
 - 定制提交保持小而可读，便于 `git rebase upstream/main`。
+
+## 实现说明（截至 Part 2）
+
+- `sb api show <file>` **默认只返回 `derived` 摘要**（不返回原文）——因为原文含私钥/口令，落进日志就是事故；需要原文请显式 `--raw`。
+- `derived` 不依赖固定下标，按数组遍历算：`inbounds[]`（含 `users[].flow`）、`outbounds[]`（`has_auth` 只报布尔）、`route.rules[]`、`tls`（私钥/公钥只报布尔）。
+- `conf_candidates()` 统一了解析顺序：**精确 → 唯一前缀**，且永远排除 `.bak` / `.tmp` / `.json.json`（`sb del` 曾因 `.bak` 混入候选而失败）。
+- 自测：`bash tests/api_smoke.sh`（34 项，纯本地、不需要真机）。

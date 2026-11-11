@@ -1080,6 +1080,26 @@ add() {
 
 # get config info
 # or somes required args
+# proxyaio fork: 配置文件候选解析
+# 顺序：① 精确命中（带/不带 .json）② 唯一前缀匹配；永远排除 .bak/.tmp/.json.json
+# 背景：旧实现用 `grep -E -i "$is_file_str"` 子串匹配，传 X.json 会同时命中
+#       X.json 与 X.json.bak，导致交互式「请选择 [1-2]」，非交互调用直接失败。
+conf_candidates() {
+    local want=$1
+    local base=$is_conf_dir
+    [[ ! -d $base ]] && return 0
+    local name
+    name=$(basename "$want")
+    local cand
+    for cand in "$name" "${name%.json}.json"; do
+        [[ -f "$base/$cand" ]] && printf '%s\n' "$cand" && return 0
+    done
+    ls -1 "$base" 2>/dev/null |
+        grep -E '\.json$' |
+        grep -v -E '\.json\.(bak|tmp)$|\.json\.json$' |
+        grep -F -- "$name"
+}
+
 get() {
     case $1 in
     addr)
@@ -1097,15 +1117,22 @@ get() {
         ;;
     file)
         is_file_str=$2
-        [[ ! $is_file_str ]] && is_file_str='.json$'
-        # is_all_json=("$(ls $is_conf_dir | grep -E $is_file_str)")
-        readarray -t is_all_json <<<"$(ls $is_conf_dir | grep -E -i "$is_file_str" | sed '/dynamic-port-.*-link/d' | head -233)" # limit max 233 lines for show.
+        # proxyaio fork: ① 传了名字 → conf_candidates 精确优先 ② 没传 → 列全部（仍是 *.json）
+        is_all_json=()
+        while IFS= read -r is_tmp_name; do
+            [[ $is_tmp_name ]] && is_all_json+=("$is_tmp_name")
+        done < <(if [[ $is_file_str ]]; then conf_candidates "$is_file_str"; fi)
+        if [[ ${#is_all_json[@]} -eq 0 ]]; then
+            while IFS= read -r is_tmp_name; do
+                [[ $is_tmp_name ]] && is_all_json+=("$is_tmp_name")
+            done < <(ls $is_conf_dir 2>/dev/null | grep -E -i '\.json$' | grep -v -E '\.json\.(bak|tmp)$|\.json\.json$' | sed '/dynamic-port-.*-link/d' | head -233) # limit max 233 lines for show.
+        fi
         [[ ! $is_all_json ]] && err "无法找到相关的配置文件: $2"
         [[ ${#is_all_json[@]} -eq 1 ]] && is_config_file=$is_all_json && is_auto_get_config=1
-        [[ ! $is_config_file ]] && {
+        if [[ ! $is_config_file ]]; then
             [[ $is_dont_auto_exit ]] && return
             ask get_config_file
-        }
+        fi
         ;;
     info)
         get file $2
